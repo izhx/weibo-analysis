@@ -3,6 +3,12 @@
 dev/
 ernie_skep_sentiment_analysis/assets/
 
+# data
+*.pkl
+*.xlsx
+*.gensim
+*.tar.gz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
