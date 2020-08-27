@@ -1,0 +1,3 @@
+[submodule "PaddleHub"]
+	path = PaddleHub
+	url = https://github.com/izhx/PaddleHub.git
