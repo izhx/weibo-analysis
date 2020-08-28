@@ -5,20 +5,18 @@
 import os
 import re
 # import time
-import pickle
 import logging
 from codecs import open
-from typing import List
 from argparse import ArgumentParser
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 
+from numpy import zeros
 from gensim.corpora import Dictionary
 from gensim.models import LdaModel, LdaMulticore
-from pandas import DataFrame, Series, read_excel
+from pandas import DataFrame, Series, read_excel, concat
 
-from skep import skep_analysis
-from util import LTP_DIR, output, generate_batch
-from statistic import to_excel
+from util import LTP_DIR, output, generate_batch, to_excel, cache_path, dump_cache, load_cache
+from workers import skep_consumer, skep_producer, ltp_tokenzier
 
 
 with open(f"{LTP_DIR}/vocab.txt") as file:
@@ -35,11 +33,15 @@ URL_REGEX = re.compile(r"http[s]?://[a-zA-Z0-9.?/&=:]*")
 _ARG_PARSER = ArgumentParser(description="我的实验，需要指定配置文件")
 _ARG_PARSER.add_argument('--name', '-n',
                          type=str,
-                         default='example',
+                         default='mask',
                          help='configuration file path.')
-_ARG_PARSER.add_argument('--visible', '-v',
+_ARG_PARSER.add_argument('--ltpIDS', '-l',
                          type=str,
-                         default='2,3',
+                         default='6,7',
+                         help='gpu ids, like: 1,2,3')
+_ARG_PARSER.add_argument('--skepIDS', '-s',
+                         type=str,
+                         default='1,2,3,4,5',
                          help='gpu ids, like: 1,2,3')
 _ARG_PARSER.add_argument('--range', '-r',
                          type=str,
@@ -65,29 +67,8 @@ _ARG_PARSER.add_argument('--debug', '-d', type=bool, default=False)
 _ARGS = _ARG_PARSER.parse_args()
 
 os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-os.environ['CUDA_VISIBLE_DEVICES'] = _ARGS.visible
 
 # logging.basicConfig(format='[%(asctime)s - %(levelname)s] : %(message)s', level=logging.DEBUG)
-
-
-def ltp_tokenzie(texts, batch_size=128) -> List[List[str]]:
-    import torch
-    from ltp import LTP
-
-    ltp = LTP(LTP_DIR, torch.device('cuda:1'))
-    result = list()
-    try:
-        output(f"batch size {batch_size}, tokenize started...")
-        for batch in generate_batch(texts, batch_size):
-            # t = time.time()
-            tokens, _ = ltp.seg(batch)  # batch 128, 1.8s
-            result.extend(tokens)
-            # output(time.time() - t)
-        output("tokenize compete.")
-    except RuntimeError as e:
-        output('分词进程错误', e)
-    return result
 
 
 def read(path) -> DataFrame:
@@ -108,20 +89,58 @@ def read(path) -> DataFrame:
                 text = text[:text.find('//@')]
         return text
 
-    output(f"===> Reading from <{path}>.")
-    data: DataFrame = read_excel(path)  # .iloc[:280]
+    temp_name = os.path.basename(path).replace('.xlsx', '')
+    if os.path.isfile(cache_path(temp_name)):
+        data, texts = load_cache(temp_name)
+    else:
+        output(f"===> Reading from <{path}>.")
+        data: DataFrame = read_excel(path)  # .iloc[:280]
 
-    # 只保留想要的4列，并去除空值，截取日期
-    data = data[['contents', 'time', 'id', 'is_forward']].dropna().reset_index()
-    data['date'] = data['time'].apply(lambda s: s[:10])
-    data['contents'] = data['contents'].astype(str)
+        # 只保留想要的4列，并去除空值，截取日期
+        data = data[['contents', 'time', 'id', 'is_forward']].dropna().reset_index()
+        data['date'] = data['time'].apply(lambda s: s[:10])
+        data['contents'] = data['contents'].astype(str)
 
-    # 预处理文本，并行分词和情感分析
-    texts = data.apply(_clean, axis=1).to_list()
-    pool = Pool(1)
-    tokens = pool.apply_async(ltp_tokenzie, (texts, 192))
-    data['sentiment_score'] = skep_analysis(texts, 16)
-    data['tokens'] = tokens.get()
+        # 预处理文本
+        texts = data.apply(_clean, axis=1).to_list()
+        dump_cache((data, texts), temp_name)
+    output(f"===> got {len(data)} rows from <{path}>.")
+
+    # 解析GPU ID
+    ltp_ids = [i.strip() for i in _ARGS.ltpIDS.split(',')]
+    skep_ids = [i.strip() for i in _ARGS.skepIDS.split(',')]
+
+    # 初始化进程池，管理器，数据队列
+    pool = Pool(1 + len(ltp_ids) + len(skep_ids))  # 分别分词、获取skep输入、skep运算
+    manager = Manager()
+    feqture_queue = manager.Queue(16 * len(skep_ids))
+    result_queue = manager.Queue(16 * len(skep_ids))
+
+    # 异步任务启动
+    pool.apply_async(skep_producer, (feqture_queue, texts, 16, len(skep_ids)))
+    tokens = dict()
+    for i, (s, p) in zip(ltp_ids, generate_batch(texts, len(texts) // len(ltp_ids))):
+        tokens[(s.start, s.stop)] = pool.apply_async(ltp_tokenzier, (p, 192, i))
+    for i in skep_ids:
+        pool.apply_async(skep_consumer, (feqture_queue, result_queue, i))
+
+    # 接收结果
+    scores, counter = zeros(len(texts)), 1
+    while True:
+        _slice, array = result_queue.get()
+        # print(_slice)
+        if array is None:
+            if counter < len(skep_ids):
+                counter += 1
+            else:
+                break
+        else:
+            scores[_slice] = array
+
+    data['tokens'] = None
+    for s, t in tokens.items():
+        data['tokens'].update(Series(t.get(), range(*s)))
+    data['sentiment_score'] = scores
     pool.close()
     pool.join()
     return data[['date', 'tokens', 'id', 'sentiment_score']]
@@ -214,29 +233,20 @@ def pipline(data: DataFrame):
 
 
 def main():
-    def dump_cache(data, name):
-        path = f"./dev/cache/{name}.pkl"
-        with open(path, mode='wb') as file:
-            pickle.dump(data, file)
-        output(f"data saved at <{path}>")
-
-    def load_cache(name):
-        path = f"./dev/cache/{name}.pkl"
-        with open(path, mode='rb') as file:
-            data = pickle.load(file)
-        output(f"data loaded from <{path}>")
-        return data
-
-    if os.path.isfile(f"./dev/cache/{_ARGS.name}.pkl"):
+    if os.path.isfile(cache_path(_ARGS.name)):
         df = load_cache(_ARGS.name)
     else:
         if _ARGS.name == 'clean':
-            df: DataFrame = None
+            dfs = list()
             for i in range(6):
                 path = f"./dev/data/clean{i}_covid19.xlsx"
-                part = read(path)
-                dump_cache(part, path.replace('.xlsx', '.pkl'))
-                df = df.append(part) if df else part
+                if os.path.isfile(cache_path(f'clean{i}')):
+                    part = load_cache(f'clean{i}')
+                else:
+                    part = read(path)
+                    dump_cache(part, f'clean{i}')
+                dfs.append(part)
+            df = concat(dfs, ignore_index=True)
         else:
             path = f"./dev/data/{_ARGS.name}_covid19.xlsx"
             df = read(path)
@@ -252,5 +262,7 @@ if __name__ == "__main__":
     main()
 
 """
-统计每天每主题数量，每天（每主题）感情变化，
+统计每天每主题数量，每天（每主题）感情变化
+之前331k要处理7个小时，两张卡；现在
+
 """
