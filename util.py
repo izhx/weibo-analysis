@@ -45,9 +45,8 @@ def generate_batch(data: Sequence, batch_size: int) -> Tuple[slice, Sequence]:
     for i in indices:
         _slice = slice(i, i + batch_size)
         yield _slice, data[_slice]
-    else:
-        _slice = slice(i + batch_size, len(data))
-        yield _slice, data[_slice]
+    _slice = slice(i + batch_size, len(data))
+    yield _slice, data[_slice]
 
 
 def to_excel(topics, data: DataFrame, topic_ids, name):

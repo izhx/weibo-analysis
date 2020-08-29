@@ -33,7 +33,7 @@ URL_REGEX = re.compile(r"http[s]?://[a-zA-Z0-9.?/&=:]*")
 _ARG_PARSER = ArgumentParser(description="我的实验，需要指定配置文件")
 _ARG_PARSER.add_argument('--name', '-n',
                          type=str,
-                         default='mask',
+                         default='clean',
                          help='configuration file path.')
 _ARG_PARSER.add_argument('--ltpIDS', '-l',
                          type=str,
@@ -119,7 +119,7 @@ def read(path) -> DataFrame:
     # 异步任务启动
     pool.apply_async(skep_producer, (feqture_queue, texts, 16, len(skep_ids)))
     tokens = dict()
-    for i, (s, p) in zip(ltp_ids, generate_batch(texts, len(texts) // len(ltp_ids))):
+    for i, (s, p) in zip(ltp_ids, generate_batch(texts, len(texts) // len(ltp_ids) + 1)):
         tokens[(s.start, s.stop)] = pool.apply_async(ltp_tokenzier, (p, 192, i))
     for i in skep_ids:
         pool.apply_async(skep_consumer, (feqture_queue, result_queue, i))
@@ -186,8 +186,8 @@ def pipline(data: DataFrame):
     corpus = [dictionary.doc2bow(doc) for doc in documents]
 
     _ = dictionary[0]  # This is only to "load" the dictionary.
-    print('Number of unique tokens: ', len(dictionary))
-    print('Number of documents: ', len(corpus))
+    output('Number of unique tokens: ', len(dictionary))
+    output('Number of documents: ', len(corpus))
     # test = get_model(6, corpus, dictionary.id2token)
 
     topic_range = tuple(int(s.strip()) for s in _ARGS.range.split(','))
@@ -203,6 +203,7 @@ def pipline(data: DataFrame):
         result_dict = {k: v.get() for k, v in result_dict.items()}
     else:
         pool = Pool(1)
+        kwargs['alpha'] = 'symmetric'
         for k in range(*topic_range):
             model = LdaMulticore(corpus, k, workers=_ARGS.pool_size, **kwargs)
             ids = pool.apply_async(save_and_inference, (model, corpus, k))
@@ -263,6 +264,6 @@ if __name__ == "__main__":
 
 """
 统计每天每主题数量，每天（每主题）感情变化
-之前331k要处理7个小时，两张卡；现在
+之前331k要处理7个小时，2张卡；现在20min，7张卡。
 
 """
