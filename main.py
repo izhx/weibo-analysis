@@ -6,25 +6,18 @@ import os
 import re
 # import time
 import logging
-from codecs import open
 from argparse import ArgumentParser
 from multiprocessing import Pool, Manager
 
-from numpy import zeros
-from gensim.corpora import Dictionary
+from numpy import zeros, concatenate
+from gensim.utils import grouper
 from gensim.models import LdaModel, LdaMulticore
+from gensim.corpora import Dictionary
 from pandas import DataFrame, Series, read_excel, concat
 
-from util import LTP_DIR, output, generate_batch, to_excel, cache_path, dump_cache, load_cache
+from util import STOP_WORDS, output, generate_batch, to_excel, cache_path, dump_cache, load_cache
 from workers import skep_consumer, skep_producer, ltp_tokenzier
 
-
-with open(f"{LTP_DIR}/vocab.txt") as file:
-    CHAR = set(w.strip() for w in file.readlines())
-    CHAR = set(w for w in CHAR if len(w) == 1)
-
-with open("./stopwords.txt") as file:
-    STOP_WORDS = set(w.strip() for w in file.readlines()) | CHAR
 
 FORWARD_SPLIT = re.compile(r"//@[^/:：]+[:：]")
 FORWARD_CONTENT = re.compile(r"//@[^/:：]+[:：][^/]+")
@@ -45,11 +38,11 @@ _ARG_PARSER.add_argument('--skepIDS', '-s',
                          help='gpu ids, like: 1,2,3')
 _ARG_PARSER.add_argument('--range', '-r',
                          type=str,
-                         default='5,21',
+                         default='30,60',
                          help='话题数搜索范围，左闭右开')
 _ARG_PARSER.add_argument('--passes', '-p',
                          type=int,
-                         default=50,
+                         default=10,
                          help='数据集迭代次数, epoch')
 _ARG_PARSER.add_argument('--iterations', '-it',
                          type=int,
@@ -61,14 +54,14 @@ _ARG_PARSER.add_argument('--keywords_num', '-k',
                          help='存储关键词数量')
 _ARG_PARSER.add_argument('--pool_size', '-ps',
                          type=int,
-                         default=16,
-                         help='进程池大小')
+                         default=14,
+                         help='进程池大小, 建议物理核个数')
 _ARG_PARSER.add_argument('--debug', '-d', type=bool, default=False)
 _ARGS = _ARG_PARSER.parse_args()
 
 os.environ['OMP_NUM_THREADS'] = '1'
 
-# logging.basicConfig(format='[%(asctime)s - %(levelname)s] : %(message)s', level=logging.DEBUG)
+# logging.basicConfig(format='[%(asctime)s - %(process)s - %(levelname)s] : %(message)s', level=logging.DEBUG)
 
 
 def read(path) -> DataFrame:
@@ -146,17 +139,37 @@ def read(path) -> DataFrame:
     return data[['date', 'tokens', 'id', 'sentiment_score']]
 
 
-def save_and_inference(model: LdaModel, corpus, num_topics):
+def save_and_inference(model: LdaModel, corpus, num_topics, chunksize=0):
     path = f"./dev/model/{_ARGS.name}_{num_topics}.pkl"
     try:
         model.save(path)
         output(f"model saved at <{path}>")
-        gamma, _ = model.inference(corpus)
+        if chunksize > 0:
+            gammas = [model.inference(chunk)[0] for chunk in grouper(corpus, chunksize)]
+            gamma = concatenate(gammas)
+        else:
+            gamma, _ = model.inference(corpus)
     except RuntimeError as e:
         logging.error(f"PID: {os.getpid()}, num_topics: {num_topics} error")
         print(e)
     output(f"num_topics {num_topics} inference compete.")
     return gamma.argmax(axis=1)
+
+
+def eval_and_write(data, num_topics, documents, dictionary, corpus, model, ids):
+    print('\nnum_topics: ', num_topics)
+    # print('Model perplexity: ', model.log_perplexity(corpus))  # 这个没做归一
+    top_topics = model.top_topics(corpus, documents, dictionary,
+                                  coherence='c_v', topn=_ARGS.keywords_num,
+                                  processes=_ARGS.pool_size)
+    scores = Series([t[1] for t in top_topics])
+    print('Coherence Score: ', scores.mean())
+    # 得到关键词词频
+    topics_info = list()
+    for _topic in top_topics:
+        tokens = [(t[1], t[0], dictionary.cfs[dictionary.token2id[t[1]]]) for t in _topic[0]]
+        topics_info.append((tokens, _topic[1]))
+    to_excel(topics_info, data, ids, _ARGS.name)
 
 
 def get_model(corpus, num_topics, kwargs):
@@ -172,18 +185,22 @@ def get_model(corpus, num_topics, kwargs):
 
 def pipline(data: DataFrame):
     documents = data['tokens'].to_list()
-    # Create a dictionary representation of the documents.
-    dictionary = Dictionary(documents)
+    if os.path.isfile(cache_path('run/' + _ARGS.name)):
+        corpus, dictionary = load_cache('run/' + _ARGS.name)
+    else:
+        # Create a dictionary representation of the documents.
+        dictionary = Dictionary(documents)
 
-    # Filter out words that occur less than 20 documents, or more than 50% of the documents.
-    dictionary.filter_extremes(no_below=20, no_above=0.5)
+        # Filter out words that occur less than 20 documents, or more than 50% of the documents.
+        dictionary.filter_extremes(no_below=20, no_above=0.5)
 
-    # 去停用词
-    bad_ids = [dictionary.token2id[t] for t in STOP_WORDS if t in dictionary.token2id]
-    dictionary.filter_tokens(bad_ids=bad_ids)
+        # 去停用词
+        bad_ids = [dictionary.token2id[t] for t in STOP_WORDS if t in dictionary.token2id]
+        dictionary.filter_tokens(bad_ids=bad_ids)
 
-    # Bag-of-words representation of the documents.
-    corpus = [dictionary.doc2bow(doc) for doc in documents]
+        # Bag-of-words representation of the documents.
+        corpus = [dictionary.doc2bow(doc) for doc in documents]
+        dump_cache((corpus, dictionary), 'run/' + _ARGS.name)
 
     _ = dictionary[0]  # This is only to "load" the dictionary.
     output('Number of unique tokens: ', len(dictionary))
@@ -193,42 +210,29 @@ def pipline(data: DataFrame):
     topic_range = tuple(int(s.strip()) for s in _ARGS.range.split(','))
     kwargs = dict(
         id2word=dictionary.id2token, chunksize=len(corpus),
-        passes=_ARGS.passes, alpha='auto', eta='auto', eval_every=None,
+        passes=_ARGS.passes, alpha='auto', eta='auto', eval_every=1,
         iterations=_ARGS.iterations, random_state=123)
-    result_dict = dict()
-    if len(corpus) < 5e5:  # 并行训练模型
+    if len(corpus) < 1e6:  # 并行训练模型
         pool = Pool(_ARGS.pool_size)
+        result_dict = dict()
         for k in range(*topic_range):
             result_dict[k] = pool.apply_async(get_model, (corpus, k, kwargs))
         result_dict = {k: v.get() for k, v in result_dict.items()}
+        pool.close()  # 等子进程执行完毕后关闭进程池
+        pool.join()
+        output(f"Searched range{topic_range}")
+        # 计算一致性的代码自己有多进程，所以只能串行
+        for k, (model, ids) in result_dict.items():
+            eval_and_write(data, k, documents, dictionary, corpus, model, ids)
     else:
-        pool = Pool(1)
         kwargs['alpha'] = 'symmetric'
-        for k in range(*topic_range):
+        kwargs['chunksize'] = len(corpus) // _ARGS.pool_size + 1
+        # kwargs['batch'] = True
+        for k in range(*topic_range, 2):  # 大数据就粗点筛
             model = LdaMulticore(corpus, k, workers=_ARGS.pool_size, **kwargs)
-            ids = pool.apply_async(save_and_inference, (model, corpus, k))
-            result_dict[k] = [model, ids]
-        result_dict = {k: (v[0], v[1].get()) for k, v in result_dict.items()}
-    pool.close()  # 等子进程执行完毕后关闭进程池
-    pool.join()
-
-    output(f"Searched range{topic_range}")
-
-    # 计算一致性的代码自己有多进程，所以只能串行
-    for k, (model, ids) in result_dict.items():
-        print('\nnum_topics: ', k)
-        # print('Model perplexity: ', model.log_perplexity(corpus))  # 这个没做归一
-        top_topics = model.top_topics(corpus, documents, dictionary,
-                                      coherence='c_v', topn=_ARGS.keywords_num,
-                                      processes=_ARGS.pool_size)
-        scores = Series([t[1] for t in top_topics])
-        print('Coherence Score: ', scores.mean())
-        # 得到关键词词频
-        topics_info = list()
-        for _topic in top_topics:
-            tokens = [(t[1], t[0], dictionary.cfs[dictionary.token2id[t[1]]]) for t in _topic[0]]
-            topics_info.append((tokens, _topic[1]))
-        to_excel(topics_info, data, ids, _ARGS.name)
+            ids = save_and_inference(model, corpus, k, kwargs['chunksize'])
+            # result_dict[k] = (model, ids)  # 内存不够用啊，4M句子
+            eval_and_write(data, k, documents, dictionary, corpus, model, ids)
 
     output(f"===> {_ARGS.name} compete. \n")
 
@@ -253,7 +257,7 @@ def main():
             df = read(path)
 
         dump_cache(df, _ARGS.name)
-        logging.disable(level=logging.INFO)
+        # logging.disable(level=logging.INFO)
 
     pipline(df)
     return

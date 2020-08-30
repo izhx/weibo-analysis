@@ -15,6 +15,13 @@ LTP_DIR = "/data/private/zms/model_weight/ltp4-base/"
 SKEP_DIR = "./ernie_skep_sentiment_analysis/"
 CACHE_DIR = "./dev/cache/"
 
+with open(f"{LTP_DIR}/vocab.txt") as file:
+    CHAR = set(w.strip() for w in file.readlines())
+    CHAR = set(w for w in CHAR if len(w) == 1)
+
+with open("./stopwords.txt") as file:
+    STOP_WORDS = set(w.strip() for w in file.readlines()) | CHAR
+
 
 def output(*args):
     message = ''.join([str(arg) for arg in args])
