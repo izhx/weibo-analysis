@@ -60,7 +60,8 @@ def to_excel(topics, data: DataFrame, topic_ids, name):
     """
     统计信息并写入
     """
-    data['topic_id'] = topic_ids
+    df = data or load_cache(name)
+    df['topic_id'] = topic_ids
     # 单独输出统计结果
     workbook = Workbook()
     sheet = workbook.active
@@ -78,7 +79,7 @@ def to_excel(topics, data: DataFrame, topic_ids, name):
             sheet.cell(r, c + 2).value = freq
             sheet.cell(r, c + 3).value = float(weight)
 
-    dates = sorted(data['date'].unique())
+    dates = sorted(df['date'].unique())
     head = ['日期', '总'] + [f"topic_{i}" for i in range(len(topics))]
 
     num_sheet = workbook.create_sheet('微博数')
@@ -89,7 +90,7 @@ def to_excel(topics, data: DataFrame, topic_ids, name):
     for r, date in enumerate(dates, 2):
         num_sheet.cell(r, 1).value = date
         sent_sheet.cell(r, 1).value = date
-        today = data[data.date == date]
+        today = df[df.date == date]
         num_sheet.cell(r, 2).value = len(today)
         score = today['sentiment_score'].mean()
         sent_sheet.cell(r, 2).value = score
@@ -103,18 +104,20 @@ def to_excel(topics, data: DataFrame, topic_ids, name):
         r += 1
         num_sheet.cell(r, 1).value = '平均'
         sent_sheet.cell(r, 1).value = '平均'
-        num_sheet.cell(r, 2).value = len(data)
-        score = data['sentiment_score'].mean()
+        num_sheet.cell(r, 2).value = len(df)
+        score = df['sentiment_score'].mean()
         sent_sheet.cell(r, 2).value = score
         for tid in range(len(topics)):
-            _topic = data.query(f"topic_id == {tid}")
+            _topic = df.query(f"topic_id == {tid}")
             num_sheet.cell(r, tid + 3).value = len(_topic)
             _topic_score = _topic['sentiment_score'].mean()
             sent_sheet.cell(r, tid + 3).value = _topic_score
 
     sheet = workbook.create_sheet('id与topic_id')
-    data.apply(lambda x: sheet.append([x.id, int(x.topic_id)]), axis=1)
+    df.apply(lambda x: sheet.append([x.id, int(x.topic_id)]), axis=1)
 
     path = f"./dev/excel/{name}_{len(topics)}.xlsx"
     workbook.save(path)
+    if data is None:
+        del df, workbook
     print(f"==> result saved at <{path}>")

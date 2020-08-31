@@ -3,6 +3,7 @@
 """
 
 import os
+import gc
 import re
 # import time
 import logging
@@ -17,6 +18,7 @@ from pandas import DataFrame, Series, read_excel, concat
 
 from util import STOP_WORDS, output, generate_batch, to_excel, cache_path, dump_cache, load_cache
 from workers import skep_consumer, skep_producer, ltp_tokenzier
+# from ldamulticore import LdaMulticore
 
 
 FORWARD_SPLIT = re.compile(r"//@[^/:：]+[:：]")
@@ -61,7 +63,7 @@ _ARGS = _ARG_PARSER.parse_args()
 
 os.environ['OMP_NUM_THREADS'] = '1'
 
-# logging.basicConfig(format='[%(asctime)s - %(process)s - %(levelname)s] : %(message)s', level=logging.DEBUG)
+logging.basicConfig(format='[%(asctime)s - %(process)s - %(levelname)s] : %(message)s', level=logging.DEBUG)
 
 
 def read(path) -> DataFrame:
@@ -184,10 +186,10 @@ def get_model(corpus, num_topics, kwargs):
 
 
 def pipline(data: DataFrame):
-    documents = data['tokens'].to_list()
     if os.path.isfile(cache_path('run/' + _ARGS.name)):
-        corpus, dictionary = load_cache('run/' + _ARGS.name)
-    else:
+        corpus, dictionary, documents = load_cache('run/' + _ARGS.name)
+    elif data:
+        documents = data['tokens'].to_list()
         # Create a dictionary representation of the documents.
         dictionary = Dictionary(documents)
 
@@ -200,7 +202,9 @@ def pipline(data: DataFrame):
 
         # Bag-of-words representation of the documents.
         corpus = [dictionary.doc2bow(doc) for doc in documents]
-        dump_cache((corpus, dictionary), 'run/' + _ARGS.name)
+        dump_cache((corpus, dictionary, documents), 'run/' + _ARGS.name)
+    else:
+        raise ValueError('cache不存在且未传入data')
 
     _ = dictionary[0]  # This is only to "load" the dictionary.
     output('Number of unique tokens: ', len(dictionary))
@@ -225,21 +229,31 @@ def pipline(data: DataFrame):
         for k, (model, ids) in result_dict.items():
             eval_and_write(data, k, documents, dictionary, corpus, model, ids)
     else:
-        kwargs['alpha'] = 'symmetric'
-        kwargs['chunksize'] = len(corpus) // _ARGS.pool_size + 1
+        # kwargs['alpha'] = 'symmetric'
+        kwargs['chunksize'] = len(corpus) // 8 // _ARGS.pool_size + 1
         # kwargs['batch'] = True
         for k in range(*topic_range, 2):  # 大数据就粗点筛
-            model = LdaMulticore(corpus, k, workers=_ARGS.pool_size, **kwargs)
+            # model = LdaMulticore(corpus, k, workers=_ARGS.pool_size, **kwargs)
+            model = LdaModel(corpus, k, **kwargs)
             ids = save_and_inference(model, corpus, k, kwargs['chunksize'])
             # result_dict[k] = (model, ids)  # 内存不够用啊，4M句子
-            eval_and_write(data, k, documents, dictionary, corpus, model, ids)
+            eval_and_write(None, k, documents, dictionary, corpus, model, ids)
+            del model, ids
+            gc.collect()
 
     output(f"===> {_ARGS.name} compete. \n")
 
 
 def main():
     if os.path.isfile(cache_path(_ARGS.name)):
-        df = load_cache(_ARGS.name)
+        if _ARGS.name == 'clean':
+            # c, d = load_cache('run/' + _ARGS.name)
+            # documents = df['tokens'].to_list()
+            # dump_cache((c, d, documents), 'run/' + _ARGS.name)
+            pipline(None)
+            return
+        else:
+            df = load_cache(_ARGS.name)
     else:
         if _ARGS.name == 'clean':
             dfs = list()
@@ -258,7 +272,6 @@ def main():
 
         dump_cache(df, _ARGS.name)
         # logging.disable(level=logging.INFO)
-
     pipline(df)
     return
 
